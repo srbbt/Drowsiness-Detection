@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drowsiness Detection</title>
+    <style>
+        body, html {
+            margin: 0;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background-color: #000;
+            color: white;
+            font-family: Arial, sans-serif;
+        }
+        #canvas {
+            display: block;
+            max-width: 100%;
+            border: 1px solid #fff;
+        }
+        #controls {
+            margin-top: 10px;
+        }
+        input, button {
+            margin: 5px;
+        }
+        #blendShapes, .preview {
+            margin-top: 10px;
+            max-width: 600px;
+            overflow-y: auto;
+            height: 150px;
+        }
+        .drowsy {
+            color: red;
+            font-weight: bold;
+        }
+        .awake {
+            color: green;
+            font-weight: bold;
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3"></script>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="controls">
+        <div>
+            <label for="refNonDrowsy">Upload Non-Drowsy Image:</label>
+            <input type="file" id="refNonDrowsy" accept="image/*">
+            <canvas id="nonDrowsyPreview" class="preview"></canvas>
+        </div>
+        <div>
+            <label for="refDrowsy">Upload Drowsy Image:</label>
+            <input type="file" id="refDrowsy" accept="image/*">
+            <canvas id="drowsyPreview" class="preview"></canvas>
+        </div>
+        <button id="startDetection">Start Detection</button>
+        <span id="drowsinessPercentage"></span> | <span id="drowsinessStatus"></span>
+        <label for="threshold">Drowsiness Threshold:</label>
+        <input type="range" id="threshold" min="0" max="100" value="60">
+        <span id="thresholdValue">60</span>%
+        <button id="exportData">Export Data</button>
+    </div>
+    <div id="blendShapes"></div>
+    <script type="module">
+        import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+        const { FaceLandmarker, FilesetResolver, DrawingUtils } = vision;
+
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const blendShapesContainer = document.getElementById('blendShapes');
+        const refNonDrowsyInput = document.getElementById('refNonDrowsy');
+        const refDrowsyInput = document.getElementById('refDrowsy');
+        const startDetectionButton = document.getElementById('startDetection');
+        const drowsinessPercentageDisplay = document.getElementById('drowsinessPercentage');
+        const drowsinessStatusDisplay = document.getElementById('drowsinessStatus');
+        const thresholdInput = document.getElementById('threshold');
+        const thresholdDisplay = document.getElementById('thresholdValue');
+        const exportDataButton = document.getElementById('exportData');
+
+        let video, faceLandmarker, refNonDrowsyLandmarks, refDrowsyLandmarks, refNonDrowsyRatios, refDrowsyRatios;
+        let drowsinessPercentages = [];
+let drowsinessBuffer = [];
+let bufferCapacity = 5;
+        const snapshotInterval = 200;
+        let drowsinessThreshold = 60;
+
+        // Track counts for true and false drowsiness status
+        let trueCount = 0;
+        let falseCount = 0;
+
+        async function setupCamera() {
+            video = document.createElement('video');
+            video.style.display = 'none';
+            document.body.appendChild(video);
+
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: 'user' },
+                audio: false
+            });
+            video.srcObject = stream;
+
+            return new Promise((resolve) => {
+                video.onloadedmetadata = () => {
+                    video.play();
+                    resolve(video);
+                };
+            });
+        }
+
+        async function createFaceLandmarker() {
+            const filesetResolver = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+                    delegate: "GPU"
+                },
+                outputFaceBlendshapes: true,
+                runningMode: "IMAGE",
+                numFaces: 1
+            });
+        }
+
+        async function analyzeImage(imageFile, previewCanvas) {
+            const img = new Image();
+            img.src = URL.createObjectURL(imageFile);
+            await img.decode();
+
+            const offscreenCanvas = new OffscreenCanvas(img.width, img.height);
+            const offscreenCtx = offscreenCanvas.getContext('2d');
+            offscreenCtx.drawImage(img, 0, 0, img.width, img.height);
+
+            const results = await faceLandmarker.detect(offscreenCanvas);
+            if (results.faceLandmarks && results.faceLandmarks[0]) {
+                drawPreview(previewCanvas, img, results.faceLandmarks[0]);
+                return results.faceLandmarks[0];
+            }
+            return null;
+        }
+
+        function drawPreview(canvas, image, landmarks) {
+            const ctx = canvas.getContext('2d');
+            canvas.width = image.width;
+            canvas.height = image.height;
+            ctx.drawImage(image, 0, 0, image.width, image.height);
+
+            const drawingUtils = new DrawingUtils(ctx);
+            drawingUtils.drawConnectors(
+                landmarks,
+                FaceLandmarker.FACE_LANDMARKS_TESSELATION,
+                { color: "#C0C0C070", lineWidth: 1 }
+            );
+        }
+
+        function calculateRatios(landmarks) {
+            if (!landmarks) return null;
+
+            const ear = calculateEAR(landmarks);
+
+            return { ear };
+        }
+
+        function calculateEAR(landmarks) {
+            const leftEye = [33, 133, 159, 144, 158, 145];
+            const rightEye = [362, 382, 381, 380, 374, 373];
+
+            const leftEAR = eyeAspectRatio(leftEye, landmarks);
+            const rightEAR = eyeAspectRatio(rightEye, landmarks);
+            return (leftEAR + rightEAR) / 2;
+        }
+
+        function eyeAspectRatio(eye, landmarks) {
+            const p2_p6 = distance(landmarks[eye[1]], landmarks[eye[5]]);
+            const p3_p5 = distance(landmarks[eye[2]], landmarks[eye[4]]);
+            const p1_p4 = distance(landmarks[eye[0]], landmarks[eye[3]]);
+            return (p2_p6 + p3_p5) / (2.0 * p1_p4);
+        }
+
+        function distance(p1, p2) {
+            return Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        }
+
+        function calculateDrowsinessPercentage(currentRatios) {
+            if (!refNonDrowsyRatios || !refDrowsyRatios) return "N/A";
+
+            const keys = Object.keys(refNonDrowsyRatios);
+            let sum = 0;
+
+            for (const key of keys) {
+                const nonDrowsyValue = refNonDrowsyRatios[key];
+                const drowsyValue = refDrowsyRatios[key];
+                const currentValue = currentRatios[key];
+
+                // Normalize the difference
+                const diff = (currentValue - nonDrowsyValue) / (drowsyValue - nonDrowsyValue);
+                sum += diff;
+            }
+
+            const averageDiff = sum / keys.length;
+            const drowsiness = Math.min(1, Math.max(0, averageDiff)) * 100;
+            return drowsiness.toFixed(2);
+        }
+
+        async function captureSnapshot() {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const results = await faceLandmarker.detect(canvas);
+    if (results.faceLandmarks && results.faceLandmarks[0]) {
+        const currentRatios = calculateRatios(results.faceLandmarks[0]);
+        const drowsiness = calculateDrowsinessPercentage(currentRatios);
+        if (drowsiness!== "N/A") {
+            drowsinessBuffer.push(parseFloat(drowsiness));
+            if (drowsinessBuffer.length > bufferCapacity) {
+                drowsinessBuffer.shift();
+            }
+            const filteredBuffer = removeOutliers(drowsinessBuffer);
+            const averageDrowsiness = (filteredBuffer.reduce((a, b) => a + b, 0) / filteredBuffer.length).toFixed(2);
+            drowsinessPercentageDisplay.textContent = `Drowsiness: ${averageDrowsiness}%`;
+            drowsinessPercentages.push(averageDrowsiness); // Push average drowsiness percentage into array
+            updateDrowsinessStatus(parseFloat(averageDrowsiness));
+        }
+    }
+}
+
+
+        function removeOutliers(data, threshold = 1.5) {
+            if (data.length === 0) return data;
+
+            const mean = data.reduce((a, b) => a + b, 0) / data.length;
+            const deviations = data.map(value => Math.abs(value - mean));
+            const medianDeviation = median(deviations);
+            const zScores = deviations.map(dev => dev / medianDeviation);
+
+            return data.filter((value, index) => zScores[index] < threshold);
+        }
+
+        function median(arr) {
+            arr.sort((a, b) => a - b);
+            const mid = Math.floor(arr.length / 2);
+            if (arr.length % 2 === 0) {
+                return (arr[mid - 1] + arr[mid]) / 2;
+            } else {
+                return arr[mid];
+            }
+        }
+
+        function updateDrowsinessStatus(percentage) {
+            if (percentage >= drowsinessThreshold) {
+                drowsinessStatusDisplay.textContent = "Drowsy";
+                drowsinessStatusDisplay.classList.remove("awake");
+                drowsinessStatusDisplay.classList.add("drowsy");
+                falseCount++;
+            } else {
+                drowsinessStatusDisplay.textContent = "Awake";
+                drowsinessStatusDisplay.classList.remove("drowsy");
+                drowsinessStatusDisplay.classList.add("awake");
+                trueCount++;
+            }
+        }
+
+        async function startDetection() {
+            if (!refNonDrowsyLandmarks || !refDrowsyLandmarks) {
+                alert("Please upload both reference images before starting detection.");
+                return;
+            }
+            await setupCamera();
+            setInterval(captureSnapshot, snapshotInterval);
+        }
+
+        refNonDrowsyInput.addEventListener('change', async (event) => {
+            refNonDrowsyLandmarks = await analyzeImage(event.target.files[0], nonDrowsyPreview);
+            refNonDrowsyRatios = calculateRatios(refNonDrowsyLandmarks);
+            console.log("Non-Drowsy Ratios:", refNonDrowsyRatios);
+        });
+
+        refDrowsyInput.addEventListener('change', async (event) => {
+            refDrowsyLandmarks = await analyzeImage(event.target.files[0], drowsyPreview);
+            refDrowsyRatios = calculateRatios(refDrowsyLandmarks);
+            console.log("Drowsy Ratios:", refDrowsyRatios);
+        });
+
+        thresholdInput.addEventListener('input', (event) => {
+            drowsinessThreshold = parseInt(event.target.value);
+            thresholdDisplay.textContent = drowsinessThreshold;
+        });
+
+        startDetectionButton.addEventListener('click', startDetection);
+
+        // Function to export the counts to a.txt file
+       exportDataButton.addEventListener('click', () => {
+    let data = '';
+    if (trueCount === 0 && falseCount === 0) {
+        data = 'No drowsiness data captured yet.';
+    } else {
+        const timestamp = new Date().toLocaleString();
+        data = `Drowsiness Detection Data
+
+Recorded at: ${timestamp}
+
+Threshold: ${drowsinessThreshold}%
+
+-------------------------
+
+True (Awake): ${trueCount}
+
+False (Drowsy): ${falseCount}
+
+Drowsiness Percentages:
+Each value represents the average drowsiness percentage over a 200ms interval.
+
+Percentages:
+${drowsinessPercentages.join('\n')}
+`;
+    }
+    const blob = new Blob([data], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `drowsiness_data-${new Date().toISOString().split('T')[0]}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+});
+
+        async function main() {
+            await createFaceLandmarker();
+        }
+
+        main();
+    </script>
+
+</body>
+</html>
